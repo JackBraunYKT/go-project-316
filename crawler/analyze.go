@@ -49,14 +49,15 @@ type report struct {
 }
 
 type pageReport struct {
-	URL         string             `json:"url"`
-	Depth       int                `json:"depth"`
-	HTTPStatus  int                `json:"http_status"`
-	Status      string             `json:"status"`
-	Error       string             `json:"error"`
-	SEO         seoReport          `json:"seo"`
-	BrokenLinks []brokenLinkReport `json:"broken_links"`
-	Assets      []assetReport      `json:"assets"`
+	URL          string             `json:"url"`
+	Depth        int                `json:"depth"`
+	HTTPStatus   int                `json:"http_status"`
+	Status       string             `json:"status"`
+	Error        string             `json:"error"`
+	SEO          seoReport          `json:"seo"`
+	BrokenLinks  []brokenLinkReport `json:"broken_links"`
+	Assets       []assetReport      `json:"assets"`
+	DiscoveredAt string             `json:"discovered_at"`
 }
 
 type seoReport struct {
@@ -69,8 +70,8 @@ type seoReport struct {
 
 type brokenLinkReport struct {
 	URL        string `json:"url"`
-	StatusCode int    `json:"status_code,omitempty"`
-	Error      string `json:"error,omitempty"`
+	StatusCode int    `json:"status_code"`
+	Error      string `json:"error"`
 }
 
 type assetReport struct {
@@ -242,10 +243,11 @@ func (limiter *requestLimiter) wait(ctx context.Context) error {
 
 func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth int, userAgent string, limiter *requestLimiter, retries int, resources *resourceCache) (pageReport, []string) {
 	page := pageReport{
-		URL:         pageURL,
-		Depth:       depth,
-		BrokenLinks: []brokenLinkReport{},
-		Assets:      []assetReport{},
+		URL:          pageURL,
+		Depth:        depth,
+		BrokenLinks:  []brokenLinkReport{},
+		Assets:       []assetReport{},
+		DiscoveredAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
 	resp, err := doRequest(ctx, client, pageURL, userAgent, limiter, retries)
@@ -304,7 +306,11 @@ func findBrokenLinks(resources *resourceCache, links []string) []brokenLinkRepor
 			continue
 		}
 		if result.StatusCode >= http.StatusBadRequest {
-			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, StatusCode: result.StatusCode})
+			brokenLinks = append(brokenLinks, brokenLinkReport{
+				URL:        link,
+				StatusCode: result.StatusCode,
+				Error:      http.StatusText(result.StatusCode),
+			})
 		}
 	}
 

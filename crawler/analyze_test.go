@@ -1,11 +1,13 @@
 package crawler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -42,7 +44,8 @@ type analyzePage struct {
 		StatusCode int    `json:"status_code"`
 		Error      string `json:"error"`
 	} `json:"broken_links"`
-	Assets []analyzeAsset `json:"assets"`
+	Assets       []analyzeAsset `json:"assets"`
+	DiscoveredAt string         `json:"discovered_at"`
 }
 
 type analyzeAsset struct {
@@ -91,6 +94,181 @@ func requireAssetCount(t *testing.T, assets []analyzeAsset, want int) {
 
 	if len(assets) != want {
 		t.Fatalf("assets length = %d, want %d: %#v", len(assets), want, assets)
+	}
+}
+
+const fixedReportTime = "2024-06-01T12:34:56Z"
+
+const expectedReferenceReportJSON = `{
+  "root_url": "https://example.com",
+  "depth": 1,
+  "generated_at": "2024-06-01T12:34:56Z",
+  "pages": [
+    {
+      "url": "https://example.com",
+      "depth": 0,
+      "http_status": 200,
+      "status": "ok",
+      "error": "",
+      "seo": {
+        "has_title": true,
+        "title": "Example title",
+        "has_description": true,
+        "description": "Example description",
+        "has_h1": true
+      },
+      "broken_links": [
+        {
+          "url": "https://example.com/missing",
+          "status_code": 404,
+          "error": "Not Found"
+        }
+      ],
+      "assets": [
+        {
+          "url": "https://example.com/static/logo.png",
+          "type": "image",
+          "status_code": 200,
+          "size_bytes": 12345,
+          "error": ""
+        }
+      ],
+      "discovered_at": "2024-06-01T12:34:56Z"
+    }
+  ]
+}`
+
+func newReferenceReportClient(t *testing.T) *http.Client {
+	t.Helper()
+
+	rootHTML := `
+		<html>
+			<head>
+				<title>Example title</title>
+				<meta name="description" content="Example description">
+			</head>
+			<body>
+				<h1>Example</h1>
+				<a href="/missing">Missing</a>
+				<img src="/static/logo.png" alt="">
+			</body>
+		</html>`
+
+	return newClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(rootHTML)),
+			}, nil
+		case "https://example.com/missing":
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       io.NopCloser(strings.NewReader("Not Found")),
+			}, nil
+		case "https://example.com/static/logo.png":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Length": []string{"12345"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+}
+
+func compactJSON(t *testing.T, data []byte) []byte {
+	t.Helper()
+
+	var buffer bytes.Buffer
+	if err := json.Compact(&buffer, data); err != nil {
+		t.Fatalf("JSON cannot be compacted: %v\n%s", err, string(data))
+	}
+	return buffer.Bytes()
+}
+
+func normalizeReportTimes(t *testing.T, reportBytes []byte) []byte {
+	t.Helper()
+
+	report := decodeReport(t, reportBytes)
+	normalized := string(reportBytes)
+
+	requireISO8601Time(t, "generated_at", report.GeneratedAt)
+	normalized = strings.ReplaceAll(normalized, `"`+report.GeneratedAt+`"`, `"`+fixedReportTime+`"`)
+
+	for index, page := range report.Pages {
+		field := "pages[" + strconv.Itoa(index) + "].discovered_at"
+		requireISO8601Time(t, field, page.DiscoveredAt)
+		normalized = strings.ReplaceAll(normalized, `"`+page.DiscoveredAt+`"`, `"`+fixedReportTime+`"`)
+	}
+
+	return []byte(normalized)
+}
+
+func requireISO8601Time(t *testing.T, field string, value string) {
+	t.Helper()
+
+	if value == "" {
+		t.Fatalf("%s is empty", field)
+	}
+	if _, err := time.Parse(time.RFC3339, value); err != nil {
+		t.Fatalf("%s = %q, want ISO8601/RFC3339 time: %v", field, value, err)
+	}
+}
+
+func TestAnalyzeJSONReportMatchesReference(t *testing.T) {
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		HTTPClient: newReferenceReportClient(t),
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	got := compactJSON(t, normalizeReportTimes(t, reportBytes))
+	want := compactJSON(t, []byte(expectedReferenceReportJSON))
+	if !bytes.Equal(got, want) {
+		t.Fatalf("report JSON does not match reference:\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+func TestAnalyzeIndentJSONChangesFormattingOnly(t *testing.T) {
+	compactReport, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		HTTPClient: newReferenceReportClient(t),
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	indentedReport, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		IndentJSON: true,
+		HTTPClient: newReferenceReportClient(t),
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	if bytes.Contains(compactReport, []byte("\n")) {
+		t.Fatalf("compact report contains newlines:\n%s", compactReport)
+	}
+	if !bytes.Contains(indentedReport, []byte("\n  ")) {
+		t.Fatalf("indented report is not formatted with newlines and spaces:\n%s", indentedReport)
+	}
+
+	got := compactJSON(t, normalizeReportTimes(t, indentedReport))
+	want := compactJSON(t, normalizeReportTimes(t, compactReport))
+	if !bytes.Equal(got, want) {
+		t.Fatalf("IndentJSON changed report content:\ngot:  %s\nwant: %s", got, want)
 	}
 }
 
@@ -803,8 +981,8 @@ func TestAnalyzeReportsOnlyBrokenLinks(t *testing.T) {
 	if brokenLink.StatusCode != http.StatusNotFound {
 		t.Fatalf("broken link status_code = %d, want %d", brokenLink.StatusCode, http.StatusNotFound)
 	}
-	if brokenLink.Error != "" {
-		t.Fatalf("broken link error = %q, want empty", brokenLink.Error)
+	if brokenLink.Error != "Not Found" {
+		t.Fatalf("broken link error = %q, want Not Found", brokenLink.Error)
 	}
 }
 
@@ -1089,8 +1267,8 @@ func TestAnalyzeBrokenLinksReportUsesLastRetryAttempt(t *testing.T) {
 	if brokenLinks[0].StatusCode != http.StatusNotFound {
 		t.Fatalf("broken link status_code = %d, want %d", brokenLinks[0].StatusCode, http.StatusNotFound)
 	}
-	if brokenLinks[0].Error != "" {
-		t.Fatalf("broken link error = %q, want empty", brokenLinks[0].Error)
+	if brokenLinks[0].Error != "Not Found" {
+		t.Fatalf("broken link error = %q, want Not Found", brokenLinks[0].Error)
 	}
 }
 
