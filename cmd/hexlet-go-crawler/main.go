@@ -48,16 +48,12 @@ func run(args []string, stdout, stderr io.Writer, client *http.Client) int {
 		return 0
 	}
 
-	effectiveDelay := *delay
-	if *rps > 0 {
-		effectiveDelay = time.Duration(float64(time.Second) / *rps)
-	}
-
 	report, err := crawler.Analyze(context.Background(), crawler.Options{
 		URL:         fs.Arg(0),
 		Depth:       *depth,
 		Retries:     *retries,
-		Delay:       effectiveDelay,
+		Delay:       *delay,
+		RPS:         *rps,
 		Timeout:     *timeout,
 		UserAgent:   *userAgent,
 		Concurrency: *workers,

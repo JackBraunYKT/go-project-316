@@ -10,21 +10,31 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/html"
 )
 
 type Options struct {
-	URL         string
-	Depth       int
-	Retries     int
-	Delay       time.Duration
+	URL     string
+	Depth   int
+	Retries int
+	// Delay sets the minimum process-wide interval between HTTP requests.
+	Delay time.Duration
+	// RPS sets the target process-wide requests per second. Positive RPS overrides Delay.
+	RPS         float64
 	Timeout     time.Duration
 	UserAgent   string
 	Concurrency int
 	IndentJSON  bool
 	HTTPClient  *http.Client
+}
+
+type requestLimiter struct {
+	delay time.Duration
+	mu    sync.Mutex
+	last  time.Time
 }
 
 type report struct {
@@ -77,6 +87,7 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	if client == nil {
 		client = &http.Client{}
 	}
+	limiter := newRequestLimiter(requestDelay(opts))
 
 	rootURL, err := url.Parse(opts.URL)
 	if err != nil {
@@ -103,7 +114,7 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		item := queue[0]
 		queue = queue[1:]
 
-		page, links := crawlPage(requestCtx, client, item.url, item.depth, opts.UserAgent)
+		page, links := crawlPage(requestCtx, client, item.url, item.depth, opts.UserAgent, limiter)
 		pages = append(pages, page)
 
 		if requestCtx.Err() != nil {
@@ -139,28 +150,69 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	return json.Marshal(output)
 }
 
-func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth int, userAgent string) (pageReport, []string) {
+func requestDelay(opts Options) time.Duration {
+	if opts.RPS > 0 {
+		return time.Duration(float64(time.Second) / opts.RPS)
+	}
+	if opts.Delay > 0 {
+		return opts.Delay
+	}
+	return 0
+}
+
+func newRequestLimiter(delay time.Duration) *requestLimiter {
+	if delay <= 0 {
+		return nil
+	}
+	return &requestLimiter{delay: delay}
+}
+
+func (limiter *requestLimiter) wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limiter == nil {
+		return ctx.Err()
+	}
+
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	if limiter.last.IsZero() {
+		limiter.last = now
+		return nil
+	}
+
+	waitFor := limiter.last.Add(limiter.delay).Sub(now)
+	if waitFor > 0 {
+		timer := time.NewTimer(waitFor)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	limiter.last = time.Now()
+	return nil
+}
+
+func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth int, userAgent string, limiter *requestLimiter) (pageReport, []string) {
 	page := pageReport{
 		URL:         pageURL,
 		Depth:       depth,
 		BrokenLinks: []brokenLinkReport{},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	resp, err := doRequest(ctx, client, pageURL, userAgent, limiter)
 	if err != nil {
-		page.Status = "error"
-		page.Error = err.Error()
-		return page, nil
-	}
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
 		page.Status = "error"
 		page.Error = err.Error()
 		return page, nil
@@ -193,7 +245,7 @@ func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth i
 
 	links := extractLinks(pageURL, body)
 	page.Status = "ok"
-	page.BrokenLinks = findBrokenLinks(ctx, client, links, userAgent)
+	page.BrokenLinks = findBrokenLinks(ctx, client, links, userAgent, limiter)
 
 	return page, links
 }
@@ -207,20 +259,11 @@ func sameDomain(rootURL *url.URL, link string) bool {
 	return strings.EqualFold(rootURL.Hostname(), linkURL.Hostname())
 }
 
-func findBrokenLinks(ctx context.Context, client *http.Client, links []string, userAgent string) []brokenLinkReport {
+func findBrokenLinks(ctx context.Context, client *http.Client, links []string, userAgent string, limiter *requestLimiter) []brokenLinkReport {
 	brokenLinks := []brokenLinkReport{}
 
 	for _, link := range links {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
-		if err != nil {
-			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, Error: err.Error()})
-			continue
-		}
-		if userAgent != "" {
-			req.Header.Set("User-Agent", userAgent)
-		}
-
-		resp, err := client.Do(req)
+		resp, err := doRequest(ctx, client, link, userAgent, limiter)
 		if err != nil {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
@@ -242,6 +285,21 @@ func findBrokenLinks(ctx context.Context, client *http.Client, links []string, u
 	}
 
 	return brokenLinks
+}
+
+func doRequest(ctx context.Context, client *http.Client, rawURL string, userAgent string, limiter *requestLimiter) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+	}
+	if err := limiter.wait(ctx); err != nil {
+		return nil, err
+	}
+
+	return client.Do(req)
 }
 
 func extractSEO(body []byte) seoReport {

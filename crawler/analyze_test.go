@@ -269,6 +269,197 @@ func TestAnalyzeReportsDuplicateInternalLinksOnce(t *testing.T) {
 	}
 }
 
+func TestAnalyzeSpacesHTTPRequestsByDelay(t *testing.T) {
+	const delay = 20 * time.Millisecond
+
+	rootHTML := `
+		<html>
+			<body>
+				<a href="/asset.css">Asset</a>
+				<a href="https://cdn.example.test/script.js">Script</a>
+			</body>
+		</html>`
+	requestedAt := []time.Time{}
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		requestedAt = append(requestedAt, time.Now())
+
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(rootHTML)),
+			}, nil
+		case "https://example.com/asset.css", "https://cdn.example.test/script.js":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		Delay:      delay,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	report := decodeReport(t, reportBytes)
+	requirePageCount(t, report, 1)
+	if len(requestedAt) != 3 {
+		t.Fatalf("request count = %d, want 3", len(requestedAt))
+	}
+	for i := 1; i < len(requestedAt); i++ {
+		if got := requestedAt[i].Sub(requestedAt[i-1]); got < delay {
+			t.Fatalf("request interval %d = %v, want at least %v", i, got, delay)
+		}
+	}
+}
+
+func TestAnalyzeStopsWaitingWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rootHTML := `
+		<html>
+			<body>
+				<a href="/next">Next</a>
+			</body>
+		</html>`
+	requests := 0
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		requests++
+
+		switch req.URL.String() {
+		case "https://example.com":
+			cancel()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(rootHTML)),
+			}, nil
+		case "https://example.com/next":
+			t.Fatal("second request should not start after context cancellation")
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	startedAt := time.Now()
+	reportBytes, err := Analyze(ctx, Options{
+		URL:        "https://example.com",
+		Depth:      2,
+		Delay:      time.Hour,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	if elapsed := time.Since(startedAt); elapsed > 200*time.Millisecond {
+		t.Fatalf("Analyze took %v after context cancellation, want it to stop promptly", elapsed)
+	}
+	if requests != 1 {
+		t.Fatalf("request count = %d, want 1", requests)
+	}
+
+	report := decodeReport(t, reportBytes)
+	requirePageCount(t, report, 1)
+	if report.Pages[0].Status != "ok" {
+		t.Fatalf("page status = %q, want ok", report.Pages[0].Status)
+	}
+}
+
+func TestAnalyzeReportIsStableWithAndWithoutRateLimit(t *testing.T) {
+	rootHTML := `
+		<html>
+			<body>
+				<a href="/about">About</a>
+			</body>
+		</html>`
+
+	newSiteClient := func() *http.Client {
+		return newClient(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.String() {
+			case "https://example.com":
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(strings.NewReader(rootHTML)),
+				}, nil
+			case "https://example.com/about":
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(strings.NewReader("<html><title>About</title></html>")),
+				}, nil
+			default:
+				t.Fatalf("unexpected request URL: %s", req.URL.String())
+			}
+			return nil, nil
+		})
+	}
+
+	analyze := func(opts Options) analyzeReport {
+		t.Helper()
+
+		reportBytes, err := Analyze(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("Analyze returned error: %v", err)
+		}
+		return decodeReport(t, reportBytes)
+	}
+
+	unlimitedReport := analyze(Options{
+		URL:        "https://example.com",
+		Depth:      2,
+		HTTPClient: newSiteClient(),
+	})
+	limitedReport := analyze(Options{
+		URL:        "https://example.com",
+		Depth:      2,
+		Delay:      time.Millisecond,
+		Timeout:    time.Second,
+		HTTPClient: newSiteClient(),
+	})
+
+	reports := []analyzeReport{unlimitedReport, limitedReport}
+	for _, report := range reports {
+		requirePageCount(t, report, 2)
+		for _, page := range report.Pages {
+			if page.Status != "ok" {
+				t.Fatalf("page %s status = %q, want ok; error = %q", page.URL, page.Status, page.Error)
+			}
+			if strings.Contains(page.Error, context.DeadlineExceeded.Error()) {
+				t.Fatalf("page %s has timeout error: %q", page.URL, page.Error)
+			}
+		}
+	}
+}
+
+func TestRequestDelayUsesRPSBeforeDelay(t *testing.T) {
+	got := requestDelay(Options{
+		Delay: time.Second,
+		RPS:   5,
+	})
+	want := 200 * time.Millisecond
+
+	if got != want {
+		t.Fatalf("request delay = %v, want %v", got, want)
+	}
+}
+
 func TestAnalyzeReturnsPartialJSONWhenContextIsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
