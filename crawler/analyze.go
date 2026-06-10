@@ -17,8 +17,9 @@ import (
 )
 
 type Options struct {
-	URL     string
-	Depth   int
+	URL   string
+	Depth int
+	// Retries sets how many extra attempts are made after a temporary failure.
 	Retries int
 	// Delay sets the minimum process-wide interval between HTTP requests.
 	Delay time.Duration
@@ -30,6 +31,8 @@ type Options struct {
 	IndentJSON  bool
 	HTTPClient  *http.Client
 }
+
+const retryDelay = 10 * time.Millisecond
 
 type requestLimiter struct {
 	delay time.Duration
@@ -114,7 +117,7 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		item := queue[0]
 		queue = queue[1:]
 
-		page, links := crawlPage(requestCtx, client, item.url, item.depth, opts.UserAgent, limiter)
+		page, links := crawlPage(requestCtx, client, item.url, item.depth, opts.UserAgent, limiter, opts.Retries)
 		pages = append(pages, page)
 
 		if requestCtx.Err() != nil {
@@ -204,15 +207,16 @@ func (limiter *requestLimiter) wait(ctx context.Context) error {
 	return nil
 }
 
-func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth int, userAgent string, limiter *requestLimiter) (pageReport, []string) {
+func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth int, userAgent string, limiter *requestLimiter, retries int) (pageReport, []string) {
 	page := pageReport{
 		URL:         pageURL,
 		Depth:       depth,
 		BrokenLinks: []brokenLinkReport{},
 	}
 
-	resp, err := doRequest(ctx, client, pageURL, userAgent, limiter)
+	resp, err := doRequest(ctx, client, pageURL, userAgent, limiter, retries)
 	if err != nil {
+		closeResponse(resp)
 		page.Status = "error"
 		page.Error = err.Error()
 		return page, nil
@@ -245,7 +249,7 @@ func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth i
 
 	links := extractLinks(pageURL, body)
 	page.Status = "ok"
-	page.BrokenLinks = findBrokenLinks(ctx, client, links, userAgent, limiter)
+	page.BrokenLinks = findBrokenLinks(ctx, client, links, userAgent, limiter, retries)
 
 	return page, links
 }
@@ -259,15 +263,13 @@ func sameDomain(rootURL *url.URL, link string) bool {
 	return strings.EqualFold(rootURL.Hostname(), linkURL.Hostname())
 }
 
-func findBrokenLinks(ctx context.Context, client *http.Client, links []string, userAgent string, limiter *requestLimiter) []brokenLinkReport {
+func findBrokenLinks(ctx context.Context, client *http.Client, links []string, userAgent string, limiter *requestLimiter, retries int) []brokenLinkReport {
 	brokenLinks := []brokenLinkReport{}
 
 	for _, link := range links {
-		resp, err := doRequest(ctx, client, link, userAgent, limiter)
+		resp, err := doRequest(ctx, client, link, userAgent, limiter, retries)
 		if err != nil {
-			if resp != nil && resp.Body != nil {
-				_ = resp.Body.Close()
-			}
+			closeResponse(resp)
 			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, Error: err.Error()})
 			continue
 		}
@@ -287,7 +289,25 @@ func findBrokenLinks(ctx context.Context, client *http.Client, links []string, u
 	return brokenLinks
 }
 
-func doRequest(ctx context.Context, client *http.Client, rawURL string, userAgent string, limiter *requestLimiter) (*http.Response, error) {
+func doRequest(ctx context.Context, client *http.Client, rawURL string, userAgent string, limiter *requestLimiter, retries int) (*http.Response, error) {
+	if retries < 0 {
+		retries = 0
+	}
+
+	for attempt := 0; ; attempt++ {
+		resp, err := doRequestOnce(ctx, client, rawURL, userAgent, limiter)
+		if !shouldRetry(ctx, resp, err) || attempt >= retries {
+			return resp, err
+		}
+
+		closeResponse(resp)
+		if err := waitBeforeRetry(ctx); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func doRequestOnce(ctx context.Context, client *http.Client, rawURL string, userAgent string, limiter *requestLimiter) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -300,6 +320,44 @@ func doRequest(ctx context.Context, client *http.Client, rawURL string, userAgen
 	}
 
 	return client.Do(req)
+}
+
+func shouldRetry(ctx context.Context, resp *http.Response, err error) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+
+	return resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError
+}
+
+func waitBeforeRetry(ctx context.Context) error {
+	timer := time.NewTimer(retryDelay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func closeResponse(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 }
 
 func extractSEO(body []byte) seoReport {

@@ -716,6 +716,203 @@ func TestAnalyzeReportsInvalidHTTPStatusAsError(t *testing.T) {
 	}
 }
 
+func TestAnalyzeRetriesTransientHTTPStatusUntilLimit(t *testing.T) {
+	requests := 0
+	client := newClient(func(*http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Status:     "503 Service Unavailable",
+			Body:       io.NopCloser(strings.NewReader("busy")),
+		}, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	if requests != 3 {
+		t.Fatalf("request count = %d, want 3", requests)
+	}
+
+	page := decodeReport(t, reportBytes).Pages[0]
+	if page.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("http_status = %d, want %d", page.HTTPStatus, http.StatusServiceUnavailable)
+	}
+	if page.Status != "error" {
+		t.Fatalf("status = %q, want error", page.Status)
+	}
+	if !strings.Contains(page.Error, "503 Service Unavailable") {
+		t.Fatalf("error = %q, want final 503 status", page.Error)
+	}
+}
+
+func TestAnalyzeRetriesTransientNetworkErrorAndSucceeds(t *testing.T) {
+	requests := 0
+	client := newClient(func(*http.Request) (*http.Response, error) {
+		requests++
+		if requests == 1 {
+			return nil, errors.New("temporary dial failure")
+		}
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader("<html></html>")),
+		}, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	if requests != 2 {
+		t.Fatalf("request count = %d, want 2", requests)
+	}
+
+	page := decodeReport(t, reportBytes).Pages[0]
+	if page.Status != "ok" {
+		t.Fatalf("status = %q, want ok; error = %q", page.Status, page.Error)
+	}
+	if page.HTTPStatus != http.StatusOK {
+		t.Fatalf("http_status = %d, want %d", page.HTTPStatus, http.StatusOK)
+	}
+}
+
+func TestAnalyzeDoesNotRetryPermanentHTTPStatus(t *testing.T) {
+	requests := 0
+	client := newClient(func(*http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Status:     "404 Not Found",
+			Body:       io.NopCloser(strings.NewReader("not found")),
+		}, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	if requests != 1 {
+		t.Fatalf("request count = %d, want 1", requests)
+	}
+
+	page := decodeReport(t, reportBytes).Pages[0]
+	if page.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("http_status = %d, want %d", page.HTTPStatus, http.StatusNotFound)
+	}
+	if page.Status != "error" {
+		t.Fatalf("status = %q, want error", page.Status)
+	}
+}
+
+func TestAnalyzeBrokenLinksReportUsesLastRetryAttempt(t *testing.T) {
+	rootHTML := `<html><body><a href="/asset.js">Asset</a></body></html>`
+	assetRequests := 0
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(rootHTML)),
+			}, nil
+		case "https://example.com/asset.js":
+			assetRequests++
+			if assetRequests == 1 {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Status:     "503 Service Unavailable",
+					Body:       io.NopCloser(strings.NewReader("busy")),
+				}, nil
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       io.NopCloser(strings.NewReader("missing")),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	if assetRequests != 2 {
+		t.Fatalf("asset request count = %d, want 2", assetRequests)
+	}
+
+	brokenLinks := decodeReport(t, reportBytes).Pages[0].BrokenLinks
+	if len(brokenLinks) != 1 {
+		t.Fatalf("broken_links length = %d, want 1: %#v", len(brokenLinks), brokenLinks)
+	}
+	if brokenLinks[0].StatusCode != http.StatusNotFound {
+		t.Fatalf("broken link status_code = %d, want %d", brokenLinks[0].StatusCode, http.StatusNotFound)
+	}
+	if brokenLinks[0].Error != "" {
+		t.Fatalf("broken link error = %q, want empty", brokenLinks[0].Error)
+	}
+}
+
+func TestAnalyzeDoesNotRetryAfterContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	requests := 0
+	client := newClient(func(*http.Request) (*http.Response, error) {
+		requests++
+		cancel()
+		return nil, context.Canceled
+	})
+
+	reportBytes, err := Analyze(ctx, Options{
+		URL:        "https://example.com",
+		Retries:    2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	if requests != 1 {
+		t.Fatalf("request count = %d, want 1", requests)
+	}
+
+	page := decodeReport(t, reportBytes).Pages[0]
+	if page.Status != "error" {
+		t.Fatalf("status = %q, want error", page.Status)
+	}
+	if !strings.Contains(page.Error, context.Canceled.Error()) {
+		t.Fatalf("error = %q, want context canceled", page.Error)
+	}
+}
+
 func TestAnalyzeReportsNetworkErrors(t *testing.T) {
 	client := newClient(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("network is unavailable")
