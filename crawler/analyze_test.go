@@ -22,11 +22,16 @@ type analyzeReport struct {
 	Depth       int    `json:"depth"`
 	GeneratedAt string `json:"generated_at"`
 	Pages       []struct {
-		URL        string `json:"url"`
-		Depth      int    `json:"depth"`
-		HTTPStatus int    `json:"http_status"`
-		Status     string `json:"status"`
-		Error      string `json:"error"`
+		URL         string `json:"url"`
+		Depth       int    `json:"depth"`
+		HTTPStatus  int    `json:"http_status"`
+		Status      string `json:"status"`
+		Error       string `json:"error"`
+		BrokenLinks []struct {
+			URL        string `json:"url"`
+			StatusCode int    `json:"status_code"`
+			Error      string `json:"error"`
+		} `json:"broken_links"`
 	} `json:"pages"`
 }
 
@@ -100,6 +105,71 @@ func TestAnalyzeReportsSuccessfulHTTPResponse(t *testing.T) {
 	}
 	if page.Error != "" {
 		t.Fatalf("error = %q, want empty", page.Error)
+	}
+}
+
+func TestAnalyzeReportsOnlyBrokenLinks(t *testing.T) {
+	html := `
+		<html>
+			<head>
+				<link rel="stylesheet" href="/assets/ok.css">
+				<script src="/assets/missing.js"></script>
+			</head>
+			<body>
+				<a href="mailto:support@example.com">mail</a>
+				<a href="javascript:void(0)">noop</a>
+				<a href="">empty</a>
+			</body>
+		</html>`
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com/blog/index.html":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(html)),
+			}, nil
+		case "https://example.com/assets/ok.css":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader("body{}")),
+			}, nil
+		case "https://example.com/assets/missing.js":
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       io.NopCloser(strings.NewReader("not found")),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com/blog/index.html",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	page := decodeReport(t, reportBytes).Pages[0]
+	if len(page.BrokenLinks) != 1 {
+		t.Fatalf("broken_links length = %d, want 1: %#v", len(page.BrokenLinks), page.BrokenLinks)
+	}
+
+	brokenLink := page.BrokenLinks[0]
+	if brokenLink.URL != "https://example.com/assets/missing.js" {
+		t.Fatalf("broken link URL = %q, want https://example.com/assets/missing.js", brokenLink.URL)
+	}
+	if brokenLink.StatusCode != http.StatusNotFound {
+		t.Fatalf("broken link status_code = %d, want %d", brokenLink.StatusCode, http.StatusNotFound)
+	}
+	if brokenLink.Error != "" {
+		t.Fatalf("broken link error = %q, want empty", brokenLink.Error)
 	}
 }
 
