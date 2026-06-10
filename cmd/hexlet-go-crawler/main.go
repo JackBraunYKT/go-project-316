@@ -2,70 +2,95 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"time"
 
 	"code/crawler"
+	"github.com/urfave/cli/v3"
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, &http.Client{}))
-}
+	cmd := &cli.Command{
+		Name:        "hexlet-go-crawler",
+		Usage:       "analyze a website structure",
+		UsageText:   "hexlet-go-crawler [global options] <url>",
+		Description: "A tool to crawl and analyze website structure",
+		Version:     "1.0.0",
+		Flags: []cli.Flag{
+			&cli.IntFlag{
+				Name:    "depth",
+				Usage:   "crawl depth",
+				Value:   10,
+			},
+			&cli.IntFlag{
+				Name:    "retries",
+				Usage:   "number of retries for failed requests",
+				Value:   1,
+			},
+			&cli.DurationFlag{
+				Name:    "delay",
+				Usage:   "delay between requests (example: 200ms, 1s)",
+				Value:   0,
+			},
+			&cli.DurationFlag{
+				Name:    "timeout",
+				Usage:   "per-request timeout",
+				Value:   15 * time.Second,
+			},
+			&cli.StringFlag{
+				Name:    "user-agent",
+				Usage:   "custom user agent",
+				Value:   "",
+			},
+			&cli.IntFlag{
+				Name:    "workers",
+				Usage:   "number of concurrent workers",
+				Value:   4,
+			},
+			&cli.BoolFlag{
+				Name:    "indent",
+				Usage:   "indent JSON output",
+				Value:   true,
+			},
+			&cli.IntFlag{
+				Name:    "rps",
+				Usage:   "requests per second limit (overrides delay)",
+				Value:   0,
+			},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			url := c.Args().First()
+			if url == "" {
+				return cli.Exit("URL is required", 1)
+			}
 
-func run(args []string, stdout, stderr io.Writer, client *http.Client) int {
-	fs := flag.NewFlagSet("hexlet-go-crawler", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+			opts := crawler.Options{
+				URL:         url,
+				Depth:       c.Int("depth"),
+				Retries:     c.Int("retries"),
+				Delay:       c.Duration("delay"),
+				Timeout:     c.Duration("timeout"),
+				UserAgent:   c.String("user-agent"),
+				Concurrency: c.Int("workers"),
+				IndentJSON:  c.Bool("indent"),
+				RPS:         c.Int("rps"),
+				HTTPClient:  &http.Client{Timeout: c.Duration("timeout")},
+			}
 
-	depth := fs.Int("depth", 10, "crawl depth")
-	retries := fs.Int("retries", 1, "number of retries for failed requests")
-	delay := fs.Duration("delay", 0*time.Second, "delay between requests (example: 200ms, 1s)")
-	timeout := fs.Duration("timeout", 15*time.Second, "per-request timeout")
-	rps := fs.Float64("rps", 0, "limit requests per second (overrides delay)")
-	userAgent := fs.String("user-agent", "", "custom user agent")
-	workers := fs.Int("workers", 4, "number of concurrent workers")
+			report, err := crawler.Analyze(ctx, opts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+			}
 
-	fs.Usage = func() {
-		fmt.Fprintln(stderr, "NAME:")
-		fmt.Fprintln(stderr, "   hexlet-go-crawler - analyze a website structure")
-		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "USAGE:")
-		fmt.Fprintln(stderr, "   hexlet-go-crawler [global options] <url>")
-		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "GLOBAL OPTIONS:")
-		fs.PrintDefaults()
+			fmt.Println(string(report))
+			return nil
+		},
 	}
 
-	if err := fs.Parse(args); err != nil {
-		return 0
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
-	if fs.NArg() == 0 {
-		fmt.Fprintln(stderr, "URL is required")
-		fs.Usage()
-		return 0
-	}
-
-	report, err := crawler.Analyze(context.Background(), crawler.Options{
-		URL:         fs.Arg(0),
-		Depth:       *depth,
-		Retries:     *retries,
-		Delay:       *delay,
-		RPS:         *rps,
-		Timeout:     *timeout,
-		UserAgent:   *userAgent,
-		Concurrency: *workers,
-		IndentJSON:  true,
-		HTTPClient:  client,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return 0
-	}
-
-	_, _ = stdout.Write(report)
-	fmt.Fprintln(stdout)
-	return 0
 }

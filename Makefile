@@ -1,16 +1,16 @@
-.PHONY: build test run
-
-GOCACHE_DIR := $(CURDIR)/.cache/go-build
-GO := GOCACHE=$(GOCACHE_DIR) go
+.PHONY: build test run lint clean
 
 build:
-	@mkdir -p bin $(GOCACHE_DIR)
-	@$(GO) build -o bin/hexlet-go-crawler ./cmd/hexlet-go-crawler
+	go build -o bin/hexlet-go-crawler ./cmd/hexlet-go-crawler
 
 test:
-	@mkdir -p $(GOCACHE_DIR)
-	@$(GO) test ./...
+	go test ./...
 
 run:
-	@mkdir -p $(GOCACHE_DIR)
-	@$(GO) run ./cmd/hexlet-go-crawler $(URL)
+	go run ./cmd/hexlet-go-crawler $(URL)
+
+lint:
+	golangci-lint run ./...
+
+clean:
+	rm -rf bin/
