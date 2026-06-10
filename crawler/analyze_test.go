@@ -42,6 +42,15 @@ type analyzePage struct {
 		StatusCode int    `json:"status_code"`
 		Error      string `json:"error"`
 	} `json:"broken_links"`
+	Assets []analyzeAsset `json:"assets"`
+}
+
+type analyzeAsset struct {
+	URL        string `json:"url"`
+	Type       string `json:"type"`
+	StatusCode int    `json:"status_code"`
+	SizeBytes  int    `json:"size_bytes"`
+	Error      string `json:"error"`
 }
 
 func decodeReport(t *testing.T, reportBytes []byte) analyzeReport {
@@ -75,6 +84,14 @@ func countPagesByURL(pages []analyzePage, url string) int {
 		}
 	}
 	return count
+}
+
+func requireAssetCount(t *testing.T, assets []analyzeAsset, want int) {
+	t.Helper()
+
+	if len(assets) != want {
+		t.Fatalf("assets length = %d, want %d: %#v", len(assets), want, assets)
+	}
 }
 
 func TestAnalyzeReportsSuccessfulHTTPResponse(t *testing.T) {
@@ -266,6 +283,203 @@ func TestAnalyzeReportsDuplicateInternalLinksOnce(t *testing.T) {
 	requirePageCount(t, report, 2)
 	if got := countPagesByURL(report.Pages, "https://example.com/guide"); got != 1 {
 		t.Fatalf("guide page count = %d, want 1", got)
+	}
+}
+
+func TestAnalyzeReportsAssetsAndCachesDuplicateRequests(t *testing.T) {
+	const assetBody = "console.log(1)"
+	rootHTML := `
+		<html>
+			<head>
+				<script src="/static/app.js"></script>
+			</head>
+			<body>
+				<a href="/about">About</a>
+			</body>
+		</html>`
+	aboutHTML := `
+		<html>
+			<head>
+				<script src="https://example.com/static/app.js"></script>
+			</head>
+		</html>`
+	requests := map[string]int{}
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		requests[req.URL.String()]++
+
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(rootHTML)),
+			}, nil
+		case "https://example.com/about":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(aboutHTML)),
+			}, nil
+		case "https://example.com/static/app.js":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Length": []string{"14"}},
+				Body:       io.NopCloser(strings.NewReader(assetBody)),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Depth:      2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	report := decodeReport(t, reportBytes)
+	requirePageCount(t, report, 2)
+	wantAsset := analyzeAsset{
+		URL:        "https://example.com/static/app.js",
+		Type:       "script",
+		StatusCode: http.StatusOK,
+		SizeBytes:  len(assetBody),
+		Error:      "",
+	}
+	for _, page := range report.Pages {
+		requireAssetCount(t, page.Assets, 1)
+		if page.Assets[0] != wantAsset {
+			t.Fatalf("page %s asset = %#v, want %#v", page.URL, page.Assets[0], wantAsset)
+		}
+	}
+	if requests["https://example.com/static/app.js"] != 1 {
+		t.Fatalf("asset request count = %d, want 1", requests["https://example.com/static/app.js"])
+	}
+}
+
+func TestAnalyzeReportsAssetSizeFromBodyWhenContentLengthIsMissing(t *testing.T) {
+	const cssBody = "body{color:red;}"
+	html := `
+		<html>
+			<head>
+				<link rel="stylesheet" href="/assets/site.css">
+			</head>
+		</html>`
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(html)),
+			}, nil
+		case "https://example.com/assets/site.css":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(cssBody)),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	assets := decodeReport(t, reportBytes).Pages[0].Assets
+	requireAssetCount(t, assets, 1)
+	if assets[0].URL != "https://example.com/assets/site.css" {
+		t.Fatalf("asset url = %q, want https://example.com/assets/site.css", assets[0].URL)
+	}
+	if assets[0].Type != "style" {
+		t.Fatalf("asset type = %q, want style", assets[0].Type)
+	}
+	if assets[0].StatusCode != http.StatusOK {
+		t.Fatalf("asset status_code = %d, want %d", assets[0].StatusCode, http.StatusOK)
+	}
+	if assets[0].SizeBytes != len(cssBody) {
+		t.Fatalf("asset size_bytes = %d, want %d", assets[0].SizeBytes, len(cssBody))
+	}
+	if assets[0].Error != "" {
+		t.Fatalf("asset error = %q, want empty", assets[0].Error)
+	}
+}
+
+func TestAnalyzeReportsFailedAssetsWithAllFields(t *testing.T) {
+	html := `<html><body><img src="/missing.png"></body></html>`
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(html)),
+			}, nil
+		case "https://example.com/missing.png":
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       io.NopCloser(strings.NewReader("missing")),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	var rawReport struct {
+		Pages []struct {
+			Assets []map[string]json.RawMessage `json:"assets"`
+		} `json:"pages"`
+	}
+	if err := json.Unmarshal(reportBytes, &rawReport); err != nil {
+		t.Fatalf("report is not valid JSON: %v", err)
+	}
+	if len(rawReport.Pages) != 1 || len(rawReport.Pages[0].Assets) != 1 {
+		t.Fatalf("raw assets are missing: %s", string(reportBytes))
+	}
+	for _, field := range []string{"url", "type", "status_code", "size_bytes", "error"} {
+		if _, exists := rawReport.Pages[0].Assets[0][field]; !exists {
+			t.Fatalf("failed asset does not contain field %q: %s", field, string(reportBytes))
+		}
+	}
+
+	assets := decodeReport(t, reportBytes).Pages[0].Assets
+	requireAssetCount(t, assets, 1)
+	if assets[0].URL != "https://example.com/missing.png" {
+		t.Fatalf("asset url = %q, want https://example.com/missing.png", assets[0].URL)
+	}
+	if assets[0].Type != "image" {
+		t.Fatalf("asset type = %q, want image", assets[0].Type)
+	}
+	if assets[0].StatusCode != http.StatusNotFound {
+		t.Fatalf("asset status_code = %d, want %d", assets[0].StatusCode, http.StatusNotFound)
+	}
+	if !strings.Contains(assets[0].Error, "404 Not Found") {
+		t.Fatalf("asset error = %q, want it to mention 404 Not Found", assets[0].Error)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,7 @@ type pageReport struct {
 	Error       string             `json:"error"`
 	SEO         seoReport          `json:"seo"`
 	BrokenLinks []brokenLinkReport `json:"broken_links"`
+	Assets      []assetReport      `json:"assets"`
 }
 
 type seoReport struct {
@@ -69,6 +71,36 @@ type brokenLinkReport struct {
 	URL        string `json:"url"`
 	StatusCode int    `json:"status_code,omitempty"`
 	Error      string `json:"error,omitempty"`
+}
+
+type assetReport struct {
+	URL        string `json:"url"`
+	Type       string `json:"type"`
+	StatusCode int    `json:"status_code"`
+	SizeBytes  int    `json:"size_bytes"`
+	Error      string `json:"error"`
+}
+
+type assetRef struct {
+	URL  string
+	Type string
+}
+
+type resourceResult struct {
+	StatusCode   int
+	Status       string
+	SizeBytes    int
+	Error        string
+	RequestError string
+}
+
+type resourceCache struct {
+	ctx       context.Context
+	client    *http.Client
+	userAgent string
+	limiter   *requestLimiter
+	retries   int
+	results   map[string]resourceResult
 }
 
 func Analyze(ctx context.Context, opts Options) ([]byte, error) {
@@ -91,6 +123,7 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		client = &http.Client{}
 	}
 	limiter := newRequestLimiter(requestDelay(opts))
+	resources := newResourceCache(requestCtx, client, opts.UserAgent, limiter, opts.Retries)
 
 	rootURL, err := url.Parse(opts.URL)
 	if err != nil {
@@ -117,7 +150,7 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		item := queue[0]
 		queue = queue[1:]
 
-		page, links := crawlPage(requestCtx, client, item.url, item.depth, opts.UserAgent, limiter, opts.Retries)
+		page, links := crawlPage(requestCtx, client, item.url, item.depth, opts.UserAgent, limiter, opts.Retries, resources)
 		pages = append(pages, page)
 
 		if requestCtx.Err() != nil {
@@ -207,11 +240,12 @@ func (limiter *requestLimiter) wait(ctx context.Context) error {
 	return nil
 }
 
-func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth int, userAgent string, limiter *requestLimiter, retries int) (pageReport, []string) {
+func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth int, userAgent string, limiter *requestLimiter, retries int, resources *resourceCache) (pageReport, []string) {
 	page := pageReport{
 		URL:         pageURL,
 		Depth:       depth,
 		BrokenLinks: []brokenLinkReport{},
+		Assets:      []assetReport{},
 	}
 
 	resp, err := doRequest(ctx, client, pageURL, userAgent, limiter, retries)
@@ -238,20 +272,17 @@ func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth i
 
 	page.SEO = extractSEO(body)
 	if resp.StatusCode != http.StatusOK {
-		status := resp.Status
-		if status == "" {
-			status = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
-		}
 		page.Status = "error"
-		page.Error = fmt.Sprintf("unexpected HTTP status: %s", status)
+		page.Error = fmt.Sprintf("unexpected HTTP status: %s", responseStatus(resp))
 		return page, nil
 	}
 
 	links := extractLinks(pageURL, body)
 	page.Status = "ok"
-	page.BrokenLinks = findBrokenLinks(ctx, client, links, userAgent, limiter, retries)
+	page.Assets = checkAssets(resources, extractAssets(pageURL, body))
+	page.BrokenLinks = findBrokenLinks(resources, links)
 
-	return page, links
+	return page, extractPageLinks(pageURL, body)
 }
 
 func sameDomain(rootURL *url.URL, link string) bool {
@@ -263,30 +294,139 @@ func sameDomain(rootURL *url.URL, link string) bool {
 	return strings.EqualFold(rootURL.Hostname(), linkURL.Hostname())
 }
 
-func findBrokenLinks(ctx context.Context, client *http.Client, links []string, userAgent string, limiter *requestLimiter, retries int) []brokenLinkReport {
+func findBrokenLinks(resources *resourceCache, links []string) []brokenLinkReport {
 	brokenLinks := []brokenLinkReport{}
 
 	for _, link := range links {
-		resp, err := doRequest(ctx, client, link, userAgent, limiter, retries)
-		if err != nil {
-			closeResponse(resp)
-			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, Error: err.Error()})
+		result := resources.get(link)
+		if result.RequestError != "" {
+			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, Error: result.RequestError})
 			continue
 		}
-		if resp == nil {
-			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, Error: "empty response"})
-			continue
-		}
-		if resp.Body != nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-		}
-		if resp.StatusCode >= http.StatusBadRequest {
-			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, StatusCode: resp.StatusCode})
+		if result.StatusCode >= http.StatusBadRequest {
+			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, StatusCode: result.StatusCode})
 		}
 	}
 
 	return brokenLinks
+}
+
+func newResourceCache(ctx context.Context, client *http.Client, userAgent string, limiter *requestLimiter, retries int) *resourceCache {
+	return &resourceCache{
+		ctx:       ctx,
+		client:    client,
+		userAgent: userAgent,
+		limiter:   limiter,
+		retries:   retries,
+		results:   map[string]resourceResult{},
+	}
+}
+
+func (cache *resourceCache) get(rawURL string) resourceResult {
+	if result, exists := cache.results[rawURL]; exists {
+		return result
+	}
+
+	result := fetchResource(cache.ctx, cache.client, rawURL, cache.userAgent, cache.limiter, cache.retries)
+	cache.results[rawURL] = result
+	return result
+}
+
+func fetchResource(ctx context.Context, client *http.Client, rawURL string, userAgent string, limiter *requestLimiter, retries int) resourceResult {
+	result := resourceResult{}
+
+	resp, err := doRequest(ctx, client, rawURL, userAgent, limiter, retries)
+	if err != nil {
+		if resp != nil {
+			result.StatusCode = resp.StatusCode
+			result.Status = responseStatus(resp)
+			if size, ok, _ := contentLength(resp); ok {
+				result.SizeBytes = size
+			}
+		}
+		closeResponse(resp)
+		result.Error = err.Error()
+		result.RequestError = err.Error()
+		return result
+	}
+	if resp == nil {
+		result.Error = "empty response"
+		result.RequestError = result.Error
+		return result
+	}
+	defer resp.Body.Close()
+
+	result.StatusCode = resp.StatusCode
+	result.Status = responseStatus(resp)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		result.Error = appendError(result.Error, fmt.Sprintf("failed to read response body: %v", err))
+		result.RequestError = result.Error
+	} else {
+		result.SizeBytes = len(body)
+	}
+
+	if size, ok, contentLengthError := contentLength(resp); ok {
+		result.SizeBytes = size
+	} else if contentLengthError != "" {
+		result.Error = appendError(result.Error, contentLengthError)
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		result.Error = appendError(result.Error, fmt.Sprintf("unexpected HTTP status: %s", result.Status))
+	}
+
+	return result
+}
+
+func contentLength(resp *http.Response) (int, bool, string) {
+	rawSize := strings.TrimSpace(resp.Header.Get("Content-Length"))
+	if rawSize == "" {
+		return 0, false, ""
+	}
+
+	size, err := strconv.Atoi(rawSize)
+	if err != nil || size < 0 {
+		return 0, false, fmt.Sprintf("invalid Content-Length: %q", rawSize)
+	}
+
+	return size, true, ""
+}
+
+func responseStatus(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	if resp.Status != "" {
+		return resp.Status
+	}
+	return fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+}
+
+func appendError(current string, next string) string {
+	if current == "" {
+		return next
+	}
+	if next == "" {
+		return current
+	}
+	return current + "; " + next
+}
+
+func checkAssets(resources *resourceCache, assets []assetRef) []assetReport {
+	reports := make([]assetReport, 0, len(assets))
+	for _, asset := range assets {
+		result := resources.get(asset.URL)
+		reports = append(reports, assetReport{
+			URL:        asset.URL,
+			Type:       asset.Type,
+			StatusCode: result.StatusCode,
+			SizeBytes:  result.SizeBytes,
+			Error:      result.Error,
+		})
+	}
+	return reports
 }
 
 func doRequest(ctx context.Context, client *http.Client, rawURL string, userAgent string, limiter *requestLimiter, retries int) (*http.Response, error) {
@@ -429,6 +569,18 @@ func cleanText(text string) string {
 }
 
 func extractLinks(pageURL string, body []byte) []string {
+	return extractHTTPLinks(pageURL, body, func(node *html.Node, attr html.Attribute) bool {
+		return strings.EqualFold(attr.Key, "href") || strings.EqualFold(attr.Key, "src")
+	})
+}
+
+func extractPageLinks(pageURL string, body []byte) []string {
+	return extractHTTPLinks(pageURL, body, func(node *html.Node, attr html.Attribute) bool {
+		return strings.EqualFold(node.Data, "a") && strings.EqualFold(attr.Key, "href")
+	})
+}
+
+func extractHTTPLinks(pageURL string, body []byte, include func(*html.Node, html.Attribute) bool) []string {
 	baseURL, err := url.Parse(pageURL)
 	if err != nil {
 		return nil
@@ -445,7 +597,7 @@ func extractLinks(pageURL string, body []byte) []string {
 	walk = func(node *html.Node) {
 		if node.Type == html.ElementNode {
 			for _, attr := range node.Attr {
-				if attr.Key != "href" && attr.Key != "src" {
+				if !include(node, attr) {
 					continue
 				}
 				link, ok := normalizeHTTPLink(baseURL, attr.Val)
@@ -467,6 +619,62 @@ func extractLinks(pageURL string, body []byte) []string {
 	walk(doc)
 
 	return links
+}
+
+func extractAssets(pageURL string, body []byte) []assetRef {
+	baseURL, err := url.Parse(pageURL)
+	if err != nil {
+		return nil
+	}
+
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return nil
+	}
+
+	seen := map[string]struct{}{}
+	assets := []assetRef{}
+	addAsset := func(rawURL string, assetType string) {
+		assetURL, ok := normalizeHTTPLink(baseURL, rawURL)
+		if !ok {
+			return
+		}
+		if _, exists := seen[assetURL]; exists {
+			return
+		}
+		seen[assetURL] = struct{}{}
+		assets = append(assets, assetRef{URL: assetURL, Type: assetType})
+	}
+
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode {
+			switch {
+			case strings.EqualFold(node.Data, "img"):
+				addAsset(attrValue(node, "src"), "image")
+			case strings.EqualFold(node.Data, "script"):
+				addAsset(attrValue(node, "src"), "script")
+			case strings.EqualFold(node.Data, "link") && hasRel(node, "stylesheet"):
+				addAsset(attrValue(node, "href"), "style")
+			}
+		}
+
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
+
+	return assets
+}
+
+func hasRel(node *html.Node, want string) bool {
+	for _, rel := range strings.Fields(attrValue(node, "rel")) {
+		if strings.EqualFold(rel, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeHTTPLink(baseURL *url.URL, rawLink string) (string, bool) {
