@@ -22,11 +22,18 @@ type analyzeReport struct {
 	Depth       int    `json:"depth"`
 	GeneratedAt string `json:"generated_at"`
 	Pages       []struct {
-		URL         string `json:"url"`
-		Depth       int    `json:"depth"`
-		HTTPStatus  int    `json:"http_status"`
-		Status      string `json:"status"`
-		Error       string `json:"error"`
+		URL        string `json:"url"`
+		Depth      int    `json:"depth"`
+		HTTPStatus int    `json:"http_status"`
+		Status     string `json:"status"`
+		Error      string `json:"error"`
+		SEO        struct {
+			HasTitle       bool   `json:"has_title"`
+			Title          string `json:"title"`
+			HasDescription bool   `json:"has_description"`
+			Description    string `json:"description"`
+			HasH1          bool   `json:"has_h1"`
+		} `json:"seo"`
 		BrokenLinks []struct {
 			URL        string `json:"url"`
 			StatusCode int    `json:"status_code"`
@@ -170,6 +177,86 @@ func TestAnalyzeReportsOnlyBrokenLinks(t *testing.T) {
 	}
 	if brokenLink.Error != "" {
 		t.Fatalf("broken link error = %q, want empty", brokenLink.Error)
+	}
+}
+
+func TestAnalyzeReportsSEOWhenTagsExist(t *testing.T) {
+	html := `
+		<html>
+			<head>
+				<title>Example &amp; Test</title>
+				<meta name="description" content="Readable &amp; useful page">
+			</head>
+			<body>
+				<h1>Welcome</h1>
+			</body>
+		</html>`
+	client := newClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(html)),
+		}, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	seo := decodeReport(t, reportBytes).Pages[0].SEO
+	if !seo.HasTitle {
+		t.Fatal("has_title = false, want true")
+	}
+	if seo.Title != "Example & Test" {
+		t.Fatalf("title = %q, want Example & Test", seo.Title)
+	}
+	if !seo.HasDescription {
+		t.Fatal("has_description = false, want true")
+	}
+	if seo.Description != "Readable & useful page" {
+		t.Fatalf("description = %q, want Readable & useful page", seo.Description)
+	}
+	if !seo.HasH1 {
+		t.Fatal("has_h1 = false, want true")
+	}
+}
+
+func TestAnalyzeReportsEmptySEOWhenTagsAreMissing(t *testing.T) {
+	client := newClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader("<html><head></head><body><p>No SEO tags</p></body></html>")),
+		}, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	seo := decodeReport(t, reportBytes).Pages[0].SEO
+	if seo.HasTitle {
+		t.Fatal("has_title = true, want false")
+	}
+	if seo.Title != "" {
+		t.Fatalf("title = %q, want empty", seo.Title)
+	}
+	if seo.HasDescription {
+		t.Fatal("has_description = true, want false")
+	}
+	if seo.Description != "" {
+		t.Fatalf("description = %q, want empty", seo.Description)
+	}
+	if seo.HasH1 {
+		t.Fatal("has_h1 = true, want false")
 	}
 }
 

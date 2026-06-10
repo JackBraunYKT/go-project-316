@@ -40,7 +40,16 @@ type pageReport struct {
 	HTTPStatus  int                `json:"http_status"`
 	Status      string             `json:"status"`
 	Error       string             `json:"error"`
+	SEO         seoReport          `json:"seo"`
 	BrokenLinks []brokenLinkReport `json:"broken_links"`
+}
+
+type seoReport struct {
+	HasTitle       bool   `json:"has_title"`
+	Title          string `json:"title"`
+	HasDescription bool   `json:"has_description"`
+	Description    string `json:"description"`
+	HasH1          bool   `json:"has_h1"`
 }
 
 type brokenLinkReport struct {
@@ -94,16 +103,19 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		if readErr != nil {
 			page.Status = "error"
 			page.Error = readErr.Error()
-		} else if resp.StatusCode == http.StatusOK {
-			page.Status = "ok"
-			page.BrokenLinks = findBrokenLinks(requestCtx, client, opts.URL, body, opts.UserAgent)
 		} else {
-			status := resp.Status
-			if status == "" {
-				status = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+			page.SEO = extractSEO(body)
+			if resp.StatusCode == http.StatusOK {
+				page.Status = "ok"
+				page.BrokenLinks = findBrokenLinks(requestCtx, client, opts.URL, body, opts.UserAgent)
+			} else {
+				status := resp.Status
+				if status == "" {
+					status = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+				}
+				page.Status = "error"
+				page.Error = fmt.Sprintf("unexpected HTTP status: %s", status)
 			}
-			page.Status = "error"
-			page.Error = fmt.Sprintf("unexpected HTTP status: %s", status)
 		}
 	}
 
@@ -156,6 +168,74 @@ func findBrokenLinks(ctx context.Context, client *http.Client, pageURL string, b
 	}
 
 	return brokenLinks
+}
+
+func extractSEO(body []byte) seoReport {
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return seoReport{}
+	}
+
+	seo := seoReport{}
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode {
+			switch node.Data {
+			case "title":
+				if !seo.HasTitle {
+					seo.HasTitle = true
+					seo.Title = cleanText(nodeText(node))
+				}
+			case "meta":
+				if !seo.HasDescription && isDescriptionMeta(node) {
+					seo.HasDescription = true
+					seo.Description = cleanText(attrValue(node, "content"))
+				}
+			case "h1":
+				seo.HasH1 = true
+			}
+		}
+
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
+
+	return seo
+}
+
+func isDescriptionMeta(node *html.Node) bool {
+	return strings.EqualFold(attrValue(node, "name"), "description")
+}
+
+func attrValue(node *html.Node, name string) string {
+	for _, attr := range node.Attr {
+		if strings.EqualFold(attr.Key, name) {
+			return attr.Val
+		}
+	}
+	return ""
+}
+
+func nodeText(node *html.Node) string {
+	var builder strings.Builder
+	var walk func(*html.Node)
+	walk = func(current *html.Node) {
+		if current.Type == html.TextNode {
+			builder.WriteString(current.Data)
+		}
+		for child := current.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(node)
+
+	return builder.String()
+}
+
+func cleanText(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 func extractLinks(pageURL string, body []byte) []string {
