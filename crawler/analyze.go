@@ -104,6 +104,7 @@ type resourceCache struct {
 	results   map[string]resourceResult
 }
 
+// Analyze собирает отчет о странице и связанных ресурсах в формате JSON.
 func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	if opts.URL == "" {
 		return nil, errors.New("url is required")
