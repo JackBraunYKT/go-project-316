@@ -18,28 +18,30 @@ func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 type analyzeReport struct {
-	RootURL     string `json:"root_url"`
-	Depth       int    `json:"depth"`
-	GeneratedAt string `json:"generated_at"`
-	Pages       []struct {
+	RootURL     string        `json:"root_url"`
+	Depth       int           `json:"depth"`
+	GeneratedAt string        `json:"generated_at"`
+	Pages       []analyzePage `json:"pages"`
+}
+
+type analyzePage struct {
+	URL        string `json:"url"`
+	Depth      int    `json:"depth"`
+	HTTPStatus int    `json:"http_status"`
+	Status     string `json:"status"`
+	Error      string `json:"error"`
+	SEO        struct {
+		HasTitle       bool   `json:"has_title"`
+		Title          string `json:"title"`
+		HasDescription bool   `json:"has_description"`
+		Description    string `json:"description"`
+		HasH1          bool   `json:"has_h1"`
+	} `json:"seo"`
+	BrokenLinks []struct {
 		URL        string `json:"url"`
-		Depth      int    `json:"depth"`
-		HTTPStatus int    `json:"http_status"`
-		Status     string `json:"status"`
+		StatusCode int    `json:"status_code"`
 		Error      string `json:"error"`
-		SEO        struct {
-			HasTitle       bool   `json:"has_title"`
-			Title          string `json:"title"`
-			HasDescription bool   `json:"has_description"`
-			Description    string `json:"description"`
-			HasH1          bool   `json:"has_h1"`
-		} `json:"seo"`
-		BrokenLinks []struct {
-			URL        string `json:"url"`
-			StatusCode int    `json:"status_code"`
-			Error      string `json:"error"`
-		} `json:"broken_links"`
-	} `json:"pages"`
+	} `json:"broken_links"`
 }
 
 func decodeReport(t *testing.T, reportBytes []byte) analyzeReport {
@@ -49,15 +51,30 @@ func decodeReport(t *testing.T, reportBytes []byte) analyzeReport {
 	if err := json.Unmarshal(reportBytes, &report); err != nil {
 		t.Fatalf("report is not valid JSON: %v", err)
 	}
-	if len(report.Pages) != 1 {
-		t.Fatalf("pages length = %d, want 1", len(report.Pages))
-	}
 
 	return report
 }
 
 func newClient(fn roundTripFunc) *http.Client {
 	return &http.Client{Transport: fn}
+}
+
+func requirePageCount(t *testing.T, report analyzeReport, want int) {
+	t.Helper()
+
+	if len(report.Pages) != want {
+		t.Fatalf("pages length = %d, want %d: %#v", len(report.Pages), want, report.Pages)
+	}
+}
+
+func countPagesByURL(pages []analyzePage, url string) int {
+	count := 0
+	for _, page := range pages {
+		if page.URL == url {
+			count++
+		}
+	}
+	return count
 }
 
 func TestAnalyzeReportsSuccessfulHTTPResponse(t *testing.T) {
@@ -112,6 +129,212 @@ func TestAnalyzeReportsSuccessfulHTTPResponse(t *testing.T) {
 	}
 	if page.Error != "" {
 		t.Fatalf("error = %q, want empty", page.Error)
+	}
+}
+
+func TestAnalyzeCrawlsInternalPagesWithinDepth(t *testing.T) {
+	rootHTML := `
+		<html>
+			<body>
+				<a href="/about">About</a>
+				<a href="/contacts">Contacts</a>
+				<a href="https://external.test/pricing">External</a>
+			</body>
+		</html>`
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(rootHTML)),
+			}, nil
+		case "https://example.com/about":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader("<html><title>About</title></html>")),
+			}, nil
+		case "https://example.com/contacts":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader("<html><title>Contacts</title></html>")),
+			}, nil
+		case "https://external.test/pricing":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader("<html></html>")),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	shallowBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Depth:      1,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	shallowReport := decodeReport(t, shallowBytes)
+	requirePageCount(t, shallowReport, 1)
+	if shallowReport.Pages[0].URL != "https://example.com" {
+		t.Fatalf("page url = %q, want https://example.com", shallowReport.Pages[0].URL)
+	}
+	if shallowReport.Pages[0].Depth != 0 {
+		t.Fatalf("page depth = %d, want 0", shallowReport.Pages[0].Depth)
+	}
+
+	deeperBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Depth:      2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	deeperReport := decodeReport(t, deeperBytes)
+	requirePageCount(t, deeperReport, 3)
+
+	wantPages := map[string]int{
+		"https://example.com":          0,
+		"https://example.com/about":    1,
+		"https://example.com/contacts": 1,
+	}
+	for _, page := range deeperReport.Pages {
+		wantDepth, exists := wantPages[page.URL]
+		if !exists {
+			t.Fatalf("unexpected page in report: %s", page.URL)
+		}
+		if page.Depth != wantDepth {
+			t.Fatalf("page %s depth = %d, want %d", page.URL, page.Depth, wantDepth)
+		}
+	}
+	if countPagesByURL(deeperReport.Pages, "https://external.test/pricing") != 0 {
+		t.Fatal("external URL appeared in pages")
+	}
+}
+
+func TestAnalyzeReportsDuplicateInternalLinksOnce(t *testing.T) {
+	rootHTML := `
+		<html>
+			<body>
+				<a href="/guide">Guide</a>
+				<a href="https://example.com/guide">Guide duplicate</a>
+				<a href="/guide#install">Guide duplicate with fragment</a>
+			</body>
+		</html>`
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(rootHTML)),
+			}, nil
+		case "https://example.com/guide":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader("<html><title>Guide</title></html>")),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	reportBytes, err := Analyze(context.Background(), Options{
+		URL:        "https://example.com",
+		Depth:      2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	report := decodeReport(t, reportBytes)
+	requirePageCount(t, report, 2)
+	if got := countPagesByURL(report.Pages, "https://example.com/guide"); got != 1 {
+		t.Fatalf("guide page count = %d, want 1", got)
+	}
+}
+
+func TestAnalyzeReturnsPartialJSONWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	firstRequests := 0
+	rootHTML := `
+		<html>
+			<body>
+				<a href="/first">First</a>
+				<a href="/second">Second</a>
+			</body>
+		</html>`
+
+	client := newClient(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://example.com":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(rootHTML)),
+			}, nil
+		case "https://example.com/first":
+			firstRequests++
+			if firstRequests == 1 {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Body:       io.NopCloser(strings.NewReader("<html></html>")),
+				}, nil
+			}
+			cancel()
+			return nil, context.Canceled
+		case "https://example.com/second":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader("<html></html>")),
+			}, nil
+		default:
+			t.Fatalf("unexpected request URL: %s", req.URL.String())
+		}
+		return nil, nil
+	})
+
+	reportBytes, err := Analyze(ctx, Options{
+		URL:        "https://example.com",
+		Depth:      2,
+		HTTPClient: client,
+	})
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	report := decodeReport(t, reportBytes)
+	requirePageCount(t, report, 2)
+	if report.Pages[0].URL != "https://example.com" {
+		t.Fatalf("first page url = %q, want https://example.com", report.Pages[0].URL)
+	}
+	if report.Pages[1].URL != "https://example.com/first" {
+		t.Fatalf("second page url = %q, want https://example.com/first", report.Pages[1].URL)
+	}
+	if report.Pages[1].Status != "error" {
+		t.Fatalf("canceled page status = %q, want error", report.Pages[1].Status)
+	}
+	if !strings.Contains(report.Pages[1].Error, context.Canceled.Error()) {
+		t.Fatalf("canceled page error = %q, want context canceled", report.Pages[1].Error)
 	}
 }
 

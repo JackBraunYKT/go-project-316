@@ -78,44 +78,50 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		client = &http.Client{}
 	}
 
-	page := pageReport{
-		URL:         opts.URL,
-		Depth:       0,
-		BrokenLinks: []brokenLinkReport{},
-	}
-
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, opts.URL, nil)
+	rootURL, err := url.Parse(opts.URL)
 	if err != nil {
 		return nil, err
 	}
-	if opts.UserAgent != "" {
-		req.Header.Set("User-Agent", opts.UserAgent)
+	rootURL.Fragment = ""
+	startURL := rootURL.String()
+
+	type crawlItem struct {
+		url   string
+		depth int
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		page.Status = "error"
-		page.Error = err.Error()
-	} else {
-		defer resp.Body.Close()
-		body, readErr := io.ReadAll(resp.Body)
-		page.HTTPStatus = resp.StatusCode
-		if readErr != nil {
-			page.Status = "error"
-			page.Error = readErr.Error()
-		} else {
-			page.SEO = extractSEO(body)
-			if resp.StatusCode == http.StatusOK {
-				page.Status = "ok"
-				page.BrokenLinks = findBrokenLinks(requestCtx, client, opts.URL, body, opts.UserAgent)
-			} else {
-				status := resp.Status
-				if status == "" {
-					status = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
-				}
-				page.Status = "error"
-				page.Error = fmt.Sprintf("unexpected HTTP status: %s", status)
+	maxPageDepth := opts.Depth - 1
+	if maxPageDepth < 0 {
+		maxPageDepth = 0
+	}
+
+	pages := []pageReport{}
+	queue := []crawlItem{{url: startURL, depth: 0}}
+	seen := map[string]struct{}{startURL: {}}
+
+	for len(queue) > 0 {
+		item := queue[0]
+		queue = queue[1:]
+
+		page, links := crawlPage(requestCtx, client, item.url, item.depth, opts.UserAgent)
+		pages = append(pages, page)
+
+		if requestCtx.Err() != nil {
+			break
+		}
+		if page.Status != "ok" || item.depth >= maxPageDepth {
+			continue
+		}
+
+		for _, link := range links {
+			if !sameDomain(rootURL, link) {
+				continue
 			}
+			if _, exists := seen[link]; exists {
+				continue
+			}
+			seen[link] = struct{}{}
+			queue = append(queue, crawlItem{url: link, depth: item.depth + 1})
 		}
 	}
 
@@ -123,7 +129,7 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		RootURL:     opts.URL,
 		Depth:       opts.Depth,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		Pages:       []pageReport{page},
+		Pages:       pages,
 	}
 
 	if opts.IndentJSON {
@@ -133,10 +139,78 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 	return json.Marshal(output)
 }
 
-func findBrokenLinks(ctx context.Context, client *http.Client, pageURL string, body []byte, userAgent string) []brokenLinkReport {
+func crawlPage(ctx context.Context, client *http.Client, pageURL string, depth int, userAgent string) (pageReport, []string) {
+	page := pageReport{
+		URL:         pageURL,
+		Depth:       depth,
+		BrokenLinks: []brokenLinkReport{},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		page.Status = "error"
+		page.Error = err.Error()
+		return page, nil
+	}
+	if userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		page.Status = "error"
+		page.Error = err.Error()
+		return page, nil
+	}
+	if resp == nil {
+		page.Status = "error"
+		page.Error = "empty response"
+		return page, nil
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	page.HTTPStatus = resp.StatusCode
+	if err != nil {
+		page.Status = "error"
+		page.Error = err.Error()
+		return page, nil
+	}
+
+	page.SEO = extractSEO(body)
+	if resp.StatusCode != http.StatusOK {
+		status := resp.Status
+		if status == "" {
+			status = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		}
+		page.Status = "error"
+		page.Error = fmt.Sprintf("unexpected HTTP status: %s", status)
+		return page, nil
+	}
+
+	links := extractLinks(pageURL, body)
+	page.Status = "ok"
+	page.BrokenLinks = findBrokenLinks(ctx, client, links, userAgent)
+
+	return page, links
+}
+
+func sameDomain(rootURL *url.URL, link string) bool {
+	linkURL, err := url.Parse(link)
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(rootURL.Hostname(), linkURL.Hostname())
+}
+
+func findBrokenLinks(ctx context.Context, client *http.Client, links []string, userAgent string) []brokenLinkReport {
 	brokenLinks := []brokenLinkReport{}
 
-	for _, link := range extractLinks(pageURL, body) {
+	for _, link := range links {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
 		if err != nil {
 			brokenLinks = append(brokenLinks, brokenLinkReport{URL: link, Error: err.Error()})
