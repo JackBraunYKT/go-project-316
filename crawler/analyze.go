@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -77,7 +78,16 @@ func Analyze(ctx context.Context, opts Options) ([]byte, error) {
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, resp.Body)
 		page.HTTPStatus = resp.StatusCode
-		page.Status = "ok"
+		if resp.StatusCode == http.StatusOK {
+			page.Status = "ok"
+		} else {
+			status := resp.Status
+			if status == "" {
+				status = fmt.Sprintf("%d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+			}
+			page.Status = "error"
+			page.Error = fmt.Sprintf("unexpected HTTP status: %s", status)
+		}
 	}
 
 	output := report{
